@@ -1,13 +1,15 @@
 module github.com/dromaniuk-gms/xk6-smpp
 
-go 1.23.0
+go 1.24.0
 
 toolchain go1.24.6
 
 require (
-	github.com/fiorix/go-smpp v0.0.0-20210403173735-2894b96e70ba
+	github.com/linxGnu/gosmpp v0.3.1
 	go.k6.io/k6 v0.52.0
 )
+
+replace github.com/fiorix/go-smpp => github.com/linxGnu/gosmpp v0.3.1
 
 require (
 	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
@@ -29,6 +31,7 @@ require (
 	github.com/mstoykov/atlas v0.0.0-20220811071828-388f114305dd // indirect
 	github.com/onsi/ginkgo v1.16.5 // indirect
 	github.com/onsi/gomega v1.38.2 // indirect
+	github.com/orcaman/concurrent-map/v2 v2.0.1 // indirect
 	github.com/serenize/snaker v0.0.0-20201027110005-a7ad2135616e // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/spf13/afero v1.1.2 // indirect
@@ -40,9 +43,10 @@ require (
 	go.opentelemetry.io/otel/sdk v1.24.0 // indirect
 	go.opentelemetry.io/otel/trace v1.24.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.1.0 // indirect
+	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/text v0.30.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240227224415-6ceb2ff114de // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240227224415-6ceb2ff114de // indirect

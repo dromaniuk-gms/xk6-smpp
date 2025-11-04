@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/fiorix/go-smpp/smpp"
-    "github.com/fiorix/go-smpp/pdu"
-    "github.com/fiorix/go-smpp/pdu/pdutext"
-    "github.com/fiorix/go-smpp/pdu/pdufield"
+	"github.com/linxGnu/gosmpp"
+	"github.com/linxGnu/gosmpp/pdu"
+
+	"go.k6.io/k6/js/modules"
 	"go.k6.io/k6/metrics"
 )
 
@@ -15,19 +15,17 @@ func init() {
 	modules.Register("k6/x/smpp", new(SMPP))
 }
 
-// Config is used from JS: smpp.connect({ host, port, system_id, password, system_type })
 type Config struct {
 	Host       string `json:"host"`
 	Port       int    `json:"port"`
 	SystemID   string `json:"system_id"`
 	Password   string `json:"password"`
 	SystemType string `json:"system_type"`
-	Bind       string `json:"bind"`
+	Bind       string `json:"bind"` // transceiver|transmitter
 }
 
 type SMPP struct{}
 
-// SMPPInstance implements modules.Instance
 type SMPPInstance struct {
 	vu      modules.VU
 	latency *metrics.Metric
@@ -40,11 +38,15 @@ var _ modules.Instance = &SMPPInstance{}
 
 func (m *SMPP) NewModuleInstance(vu modules.VU) modules.Instance {
 	reg := vu.InitEnv().Registry
+	lat := reg.MustNewMetric("smpp_submit_latency", metrics.Trend)
+	suc := reg.MustNewMetric("smpp_submit_success", metrics.Counter)
+	fail := reg.MustNewMetric("smpp_submit_failure", metrics.Counter)
+
 	return &SMPPInstance{
 		vu:      vu,
-		latency: reg.MustNewMetric("smpp_submit_latency", metrics.Trend),
-		success: reg.MustNewMetric("smpp_submit_success", metrics.Counter),
-		failure: reg.MustNewMetric("smpp_submit_failure", metrics.Counter),
+		latency: lat,
+		success: suc,
+		failure: fail,
 	}
 }
 
@@ -57,9 +59,8 @@ func (i *SMPPInstance) Exports() modules.Exports {
 	}
 }
 
-// Session returned to JS
 type Session struct {
-	tx      *smpp.Transceiver
+	tx      *gosmpp.Transceiver
 	vu      modules.VU
 	latency *metrics.Metric
 	success *metrics.Metric
@@ -68,29 +69,33 @@ type Session struct {
 
 func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
 	addr := cfg.Host
-	if cfg.Port != 0 && cfg.Host != "" {
+	if cfg.Port != 0 {
 		addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	}
 
-	tr := &smpp.Transceiver{
-		Addr:       addr,
-		User:       cfg.SystemID,
-		Passwd:     cfg.Password,
-		SystemType: cfg.SystemType,
+	settings := &gosmpp.TransceiverSettings{
+		Address:     addr,
+		User:        cfg.SystemID,
+		Password:    cfg.Password,
+		SystemType:  cfg.SystemType,
+		EnquireLink: 10 * time.Second,
+		OnSubmitError: func(p pdu.PDU, err error) {
+			fmt.Printf("submit error: %v\n", err)
+		},
+		OnReceivingPDU: func(p pdu.PDU, e error) {
+			if e != nil {
+				fmt.Printf("recv error: %v\n", e)
+			}
+		},
 	}
 
-	statusCh := tr.Bind()
-	select {
-	case st := <-statusCh:
-		if st != smpp.Connected {
-			return nil, fmt.Errorf("bind failed, status: %v", st)
-		}
-	case <-time.After(6 * time.Second):
-		return nil, fmt.Errorf("bind timeout to %s", addr)
+	tx, err := gosmpp.NewTransceiver(settings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %v", err)
 	}
 
 	return &Session{
-		tx:      tr,
+		tx:      tx,
 		vu:      i.vu,
 		latency: i.latency,
 		success: i.success,
@@ -98,28 +103,36 @@ func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
 	}, nil
 }
 
-func (s *Session) SendSMS(src, dst, text string) error {
+func (s *Session) SendSMS(src, dst, msg string) error {
 	if s.tx == nil {
 		return fmt.Errorf("not connected")
 	}
 
 	start := time.Now()
-	msg := &smpp.ShortMessage{
-		Src:  src,
-		Dst:  dst,
-		Text: pdutext.Raw([]byte(text)),
+
+	sm, err := pdu.NewSubmitSM()
+	if err != nil {
+		return err
 	}
 
-	_, err := s.tx.Submit(msg)
+	sm.SourceAddrTon = field.TonAlphanumeric
+	sm.SourceAddrNpi = field.NpiUnknown
+	sm.DestAddrTon = field.TonInternational
+	sm.DestAddrNpi = field.NpiISDN
+	sm.SourceAddr = field.NewAddress(src)
+	sm.DestinationAddr = field.NewAddress(dst)
+	sm.ShortMessage = text.Raw(msg)
+
+	err = s.tx.Transceiver().Submit(sm)
 	elapsed := time.Since(start)
 
 	state := s.vu.State()
-	tags := state.Tags.GetCurrentValues().Tags // ✅ потрібен саме .Tags
+	tags := state.Tags.GetCurrentValues()
 
 	state.Samples <- metrics.Sample{
 		TimeSeries: metrics.TimeSeries{
 			Metric: s.latency,
-			Tags:   tags,
+			Tags:   &tags,
 		},
 		Value: float64(elapsed.Seconds()),
 		Time:  time.Now(),
@@ -129,7 +142,7 @@ func (s *Session) SendSMS(src, dst, text string) error {
 		state.Samples <- metrics.Sample{
 			TimeSeries: metrics.TimeSeries{
 				Metric: s.failure,
-				Tags:   tags,
+				Tags:   &tags,
 			},
 			Value: 1,
 			Time:  time.Now(),
@@ -140,7 +153,7 @@ func (s *Session) SendSMS(src, dst, text string) error {
 	state.Samples <- metrics.Sample{
 		TimeSeries: metrics.TimeSeries{
 			Metric: s.success,
-			Tags:   tags,
+			Tags:   &tags,
 		},
 		Value: 1,
 		Time:  time.Now(),
