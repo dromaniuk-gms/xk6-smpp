@@ -5,8 +5,9 @@ import (
 	"time"
 
 	"github.com/fiorix/go-smpp/smpp"
-	"github.com/fiorix/go-smpp/smpp/pdutext"
-	"go.k6.io/k6/js/modules"
+    "github.com/fiorix/go-smpp/pdu"
+    "github.com/fiorix/go-smpp/pdu/pdutext"
+    "github.com/fiorix/go-smpp/pdu/pdufield"
 	"go.k6.io/k6/metrics"
 )
 
