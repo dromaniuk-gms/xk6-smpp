@@ -9,8 +9,6 @@ require (
 	go.k6.io/k6 v0.52.0
 )
 
-replace github.com/fiorix/go-smpp => github.com/linxGnu/gosmpp v0.3.1
-
 require (
 	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
 	github.com/dlclark/regexp2 v1.9.0 // indirect

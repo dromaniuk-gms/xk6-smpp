@@ -21,7 +21,6 @@ type Config struct {
 	SystemID   string `json:"system_id"`
 	Password   string `json:"password"`
 	SystemType string `json:"system_type"`
-	Bind       string `json:"bind"` // transceiver|transmitter
 }
 
 type SMPP struct{}
@@ -60,42 +59,45 @@ func (i *SMPPInstance) Exports() modules.Exports {
 }
 
 type Session struct {
-	tx      *gosmpp.Transceiver
+	session *gosmpp.Session
 	vu      modules.VU
 	latency *metrics.Metric
 	success *metrics.Metric
 	failure *metrics.Metric
 }
 
+// Connect creates and binds SMPP session
 func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
-	addr := cfg.Host
-	if cfg.Port != 0 {
-		addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	}
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
-	settings := &gosmpp.TransceiverSettings{
-		Address:     addr,
-		User:        cfg.SystemID,
-		Password:    cfg.Password,
-		SystemType:  cfg.SystemType,
+	settings := &gosmpp.SessionSettings{
 		EnquireLink: 10 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		ReadTimeout:  10 * time.Second,
 		OnSubmitError: func(p pdu.PDU, err error) {
-			fmt.Printf("submit error: %v\n", err)
+			fmt.Printf("Submit error: %v\n", err)
 		},
-		OnReceivingPDU: func(p pdu.PDU, e error) {
-			if e != nil {
-				fmt.Printf("recv error: %v\n", e)
+		OnPDU: func(p pdu.PDU, err error) {
+			if err != nil {
+				fmt.Printf("Received PDU error: %v\n", err)
 			}
 		},
+		BindOption: gosmpp.BindOption{
+			Addr:       addr,
+			SystemID:   cfg.SystemID,
+			Password:   cfg.Password,
+			SystemType: cfg.SystemType,
+			BindType:   gosmpp.Transceiver,
+		},
 	}
 
-	tx, err := gosmpp.NewTransceiver(settings)
+	session, err := gosmpp.NewSession(settings)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect: %v", err)
+		return nil, fmt.Errorf("failed to bind to %s: %v", addr, err)
 	}
 
 	return &Session{
-		tx:      tx,
+		session: session,
 		vu:      i.vu,
 		latency: i.latency,
 		success: i.success,
@@ -103,67 +105,47 @@ func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
 	}, nil
 }
 
-func (s *Session) SendSMS(src, dst, msg string) error {
-	if s.tx == nil {
+// SendSMS sends an SMPP submit_sm PDU
+func (s *Session) SendSMS(src, dst, message string) error {
+	if s.session == nil {
 		return fmt.Errorf("not connected")
 	}
 
 	start := time.Now()
 
-	sm, err := pdu.NewSubmitSM()
-	if err != nil {
+	sm := pdu.NewSubmitSM()
+	sm.SourceAddr = src
+	sm.DestinationAddr = dst
+	sm.ShortMessage = []byte(message)
+
+	if err := s.session.Transmitter().Submit(sm); err != nil {
+		s.pushMetric(s.failure, 1)
 		return err
 	}
 
-	sm.SourceAddrTon = field.TonAlphanumeric
-	sm.SourceAddrNpi = field.NpiUnknown
-	sm.DestAddrTon = field.TonInternational
-	sm.DestAddrNpi = field.NpiISDN
-	sm.SourceAddr = field.NewAddress(src)
-	sm.DestinationAddr = field.NewAddress(dst)
-	sm.ShortMessage = text.Raw(msg)
-
-	err = s.tx.Transceiver().Submit(sm)
 	elapsed := time.Since(start)
-
-	state := s.vu.State()
-	tags := state.Tags.GetCurrentValues()
-
-	state.Samples <- metrics.Sample{
-		TimeSeries: metrics.TimeSeries{
-			Metric: s.latency,
-			Tags:   &tags,
-		},
-		Value: float64(elapsed.Seconds()),
-		Time:  time.Now(),
-	}
-
-	if err != nil {
-		state.Samples <- metrics.Sample{
-			TimeSeries: metrics.TimeSeries{
-				Metric: s.failure,
-				Tags:   &tags,
-			},
-			Value: 1,
-			Time:  time.Now(),
-		}
-		return err
-	}
-
-	state.Samples <- metrics.Sample{
-		TimeSeries: metrics.TimeSeries{
-			Metric: s.success,
-			Tags:   &tags,
-		},
-		Value: 1,
-		Time:  time.Now(),
-	}
+	s.pushMetric(s.latency, elapsed.Seconds())
+	s.pushMetric(s.success, 1)
 
 	return nil
 }
 
+func (s *Session) pushMetric(metric *metrics.Metric, value float64) {
+	state := s.vu.State()
+	tags := state.Tags.GetCurrentValues().Clone()
+
+	state.Samples <- metrics.Sample{
+		TimeSeries: metrics.TimeSeries{
+			Metric: metric,
+			Tags:   tags,
+		},
+		Value: value,
+		Time:  time.Now(),
+	}
+}
+
 func (s *Session) Close() {
-	if s.tx != nil {
-		s.tx.Close()
+	if s.session != nil {
+		s.session.Close()
 	}
 }
