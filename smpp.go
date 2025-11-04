@@ -1,10 +1,12 @@
 package smpp
 
 import (
+    "context"
     "fmt"
     "time"
 
     "github.com/fiorix/go-smpp/smpp"
+    "github.com/fiorix/go-smpp/smpp/pdu"
     "github.com/fiorix/go-smpp/smpp/pdu/pdufield"
     "github.com/fiorix/go-smpp/smpp/pdu/pdutext"
     "go.k6.io/k6/js/modules"
@@ -15,6 +17,7 @@ type SMPP struct{}
 
 type Session struct {
     tx        *smpp.Transmitter
+    vu        modules.VU
     latency   *metrics.Metric
     successes *metrics.Metric
     failures  *metrics.Metric
@@ -44,15 +47,11 @@ var _ modules.Instance = &SMPPInstance{}
 
 func (m *SMPP) NewModuleInstance(vu modules.VU) modules.Instance {
     reg := vu.InitEnv().Registry
-    latency := reg.MustNewMetric("smpp_submit_latency", metrics.Trend)
-    successes := reg.MustNewMetric("smpp_submit_success", metrics.Counter)
-    failures := reg.MustNewMetric("smpp_submit_failure", metrics.Counter)
-
     return &SMPPInstance{
         vu:        vu,
-        latency:   latency,
-        successes: successes,
-        failures:  failures,
+        latency:   reg.MustNewMetric("smpp_submit_latency", metrics.Trend),
+        successes: reg.MustNewMetric("smpp_submit_success", metrics.Counter),
+        failures:  reg.MustNewMetric("smpp_submit_failure", metrics.Counter),
     }
 }
 
@@ -67,6 +66,7 @@ func (i *SMPPInstance) Exports() modules.Exports {
 
 func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
     addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
     tx := &smpp.Transmitter{
         Addr:       addr,
         User:       cfg.SystemID,
@@ -77,8 +77,8 @@ func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
     conn := tx.Bind()
     select {
     case status := <-conn:
-        if status.Status().Error() != nil {
-            return nil, status.Status().Error()
+        if status.Err != nil {
+            return nil, fmt.Errorf("bind failed: %v", status.Err)
         }
     case <-time.After(5 * time.Second):
         return nil, fmt.Errorf("bind timeout")
@@ -86,6 +86,7 @@ func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
 
     return &Session{
         tx:        tx,
+        vu:        i.vu,
         latency:   i.latency,
         successes: i.successes,
         failures:  i.failures,
@@ -102,20 +103,55 @@ func (s *Session) SendSMS(src, dst, text string) (string, error) {
         Src:      src,
         Dst:      dst,
         Text:     pdutext.Latin1(text),
-        Register: smpp.NoDeliveryReceipt,
+        // без Register — старе поле, уже не потрібно
     }
 
     resp, err := s.tx.Submit(msg)
     duration := time.Since(start)
 
-    metrics.PushIfNotDone(s.latency, duration.Seconds())
+    state := s.vu.State()
+    samples := state.Samples
+
+    // latency
+    samples <- metrics.Sample{
+        TimeSeries: metrics.TimeSeries{
+            Metric: s.latency,
+            Tags:   state.Tags.GetCurrentValues(),
+        },
+        Value: float64(duration.Seconds()),
+        Time:  time.Now(),
+    }
+
     if err != nil {
-        metrics.PushIfNotDone(s.failures, 1)
+        samples <- metrics.Sample{
+            TimeSeries: metrics.TimeSeries{
+                Metric: s.failures,
+                Tags:   state.Tags.GetCurrentValues(),
+            },
+            Value: 1,
+            Time:  time.Now(),
+        }
         return "", err
     }
 
-    metrics.PushIfNotDone(s.successes, 1)
-    msgID, _ := resp.Fields[pdufield.MessageID].String()
+    // success counter
+    samples <- metrics.Sample{
+        TimeSeries: metrics.TimeSeries{
+            Metric: s.successes,
+            Tags:   state.Tags.GetCurrentValues(),
+        },
+        Value: 1,
+        Time:  time.Now(),
+    }
+
+    // Витягуємо MessageID із PDU
+    var msgID string
+    if resp != nil {
+        if f := resp.Field(pdufield.MessageID); f != nil {
+            msgID, _ = f.String()
+        }
+    }
+
     return msgID, nil
 }
 
