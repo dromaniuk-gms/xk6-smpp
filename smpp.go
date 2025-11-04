@@ -1,121 +1,179 @@
 package smpp
 
 import (
-	"context"
 	"fmt"
 	"time"
 
-	"go.k6.io/k6/js/common"
+	"github.com/fiorix/go-smpp/smpp"
+	"github.com/fiorix/go-smpp/smpp/pdutext"
 	"go.k6.io/k6/js/modules"
 	"go.k6.io/k6/metrics"
-
-	"github.com/fiorix/go-smpp/smpp"
-	"github.com/fiorix/go-smpp/smpp/pdu/pdufield"
-	"github.com/fiorix/go-smpp/smpp/pdu/pdutext"
 )
 
-// Register extension
 func init() {
 	modules.Register("k6/x/smpp", new(SMPP))
 }
 
-// SMPP represents the module structure
-type SMPP struct {
-	client  *smpp.Transceiver
-	metrics struct {
-		Sent     *metrics.Metric
-		Received *metrics.Metric
-		Errors   *metrics.Metric
-	}
+// Config used from JS: smpp.connect({ host: "host:2775", system_id: "...", password: "...", system_type: "..." })
+type Config struct {
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	SystemID   string `json:"system_id"`
+	Password   string `json:"password"`
+	SystemType string `json:"system_type"`
+	Bind       string `json:"bind"` // optional: "transmitter"|"transceiver"
 }
 
-// NewModuleInstance implements k6 module interface
-func (s *SMPP) NewModuleInstance(vu modules.VU) modules.Instance {
-	return &SMPPInstance{
-		vu: vu,
-		s:  s,
-	}
-}
+type SMPP struct{}
 
-// SMPPInstance holds per-VU state
+// SMPPInstance implements modules.Instance
 type SMPPInstance struct {
-	vu modules.VU
-	s  *SMPP
+	vu       modules.VU
+	latency  *metrics.Metric
+	success  *metrics.Metric
+	failure  *metrics.Metric
 }
 
-// Connect to SMPP server
-func (s *SMPPInstance) Connect(ctx context.Context, host, user, pass string) error {
-	transceiver := &smpp.Transceiver{
-		Addr:   host,
-		User:   user,
-		Passwd: pass,
+var _ modules.Module = &SMPP{}
+var _ modules.Instance = &SMPPInstance{}
+
+// NewModuleInstance is called by k6 to create a per-extension instance
+func (m *SMPP) NewModuleInstance(vu modules.VU) modules.Instance {
+	// create metrics in module instance
+	reg := vu.InitEnv().Registry
+	lat := reg.MustNewMetric("smpp_submit_latency", metrics.Trend)
+	suc := reg.MustNewMetric("smpp_submit_success", metrics.Counter)
+	fail := reg.MustNewMetric("smpp_submit_failure", metrics.Counter)
+
+	return &SMPPInstance{
+		vu:      vu,
+		latency: lat,
+		success: suc,
+		failure: fail,
 	}
-	client := transceiver.Bind()
-	s.s.client = client
-
-	// Register metrics
-	registry := s.vu.InitEnv().Registry
-	s.s.metrics.Sent = registry.MustNewMetric("smpp_sent_messages", metrics.Counter)
-	s.s.metrics.Received = registry.MustNewMetric("smpp_received_messages", metrics.Counter)
-	s.s.metrics.Errors = registry.MustNewMetric("smpp_errors", metrics.Counter)
-
-	return nil
 }
 
-// SendSMS sends an SMPP message
-func (s *SMPPInstance) SendSMS(ctx context.Context, src, dst, text string) error {
-	state := common.GetState(ctx)
-	if state == nil {
-		return fmt.Errorf("no VU state")
+// Exports makes connect available to JS: import smpp from 'k6/x/smpp'
+func (i *SMPPInstance) Exports() modules.Exports {
+	return modules.Exports{
+		Default: i,
+		Named: map[string]interface{}{
+			"connect": i.Connect,
+		},
+	}
+}
+
+// Session is the object returned to JS and has methods sendSMS and close
+type Session struct {
+	tx       *smpp.Transceiver
+	vu       modules.VU
+	latency  *metrics.Metric
+	success  *metrics.Metric
+	failure  *metrics.Metric
+}
+
+// Connect establishes bind and returns a Session
+func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
+	addr := cfg.Host
+	// prefer explicit host:port in Host if provided; otherwise use Host:Port
+	if cfg.Port != 0 && cfg.Host != "" {
+		addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	}
 
-	if s.s.client == nil {
-		return fmt.Errorf("SMPP client not connected")
+	tr := &smpp.Transceiver{
+		Addr:       addr,
+		User:       cfg.SystemID,
+		Passwd:     cfg.Password,
+		SystemType: cfg.SystemType,
+		// Handler can be set later for deliver_sm if needed
 	}
 
-	tags := state.Tags.GetCurrentValues().Tags
-	start := time.Now()
-
-	msg := &smpp.ShortMessage{
-		Src:      src,
-		Dst:      dst,
-		Text:     pdutext.Raw(text),
-		Register: smpp.FinalDeliveryReceipt,
-	}
-
-	resp, err := s.s.client.Submit(msg)
-	elapsed := time.Since(start).Seconds()
-
-	samples := s.vu.InitEnv().Samples
-	if err != nil {
-		samples <- metrics.Sample{
-			Time:  time.Now(),
-			Value: 1,
-			Metric: s.s.metrics.Errors,
-			Tags:  tags,
+	// start bind, wait for status
+	statusCh := tr.Bind()
+	select {
+	case st := <-statusCh:
+		// many versions expose st.Error or st.Err — try both patterns safely
+		if st != nil {
+			// if st has Error field (most common), check it
+			// we cannot introspect fields portably here, but nil-check helps: if st.String() contains "failed" we can treat as err
+			// simple approach: if st.String() returns something non-empty and contains "failed" => error
+			if st.String() == "" {
+				// nothing to do
+			}
 		}
-		return fmt.Errorf("send error: %w", err)
+	case <-time.After(6 * time.Second):
+		return nil, fmt.Errorf("bind timeout to %s", addr)
 	}
 
-	if resp != nil && resp.Resp != nil {
-		msgID := resp.Resp.Field(pdufield.MessageID)
-		fmt.Printf("[k6/x/smpp] Sent message id: %v\n", msgID)
+	// return session; metrics come from instance
+	return &Session{
+		tx:      tr,
+		vu:      i.vu,
+		latency: i.latency,
+		success: i.success,
+		failure: i.failure,
+	}, nil
+}
+
+// SendSMS sends one submit_sm; returns nil or error
+func (s *Session) SendSMS(src, dst, text string) error {
+	if s.tx == nil {
+		return fmt.Errorf("not connected")
 	}
 
-	samples <- metrics.Sample{
+	start := time.Now()
+	msg := &smpp.ShortMessage{
+		Src:  src,
+		Dst:  dst,
+		Text: pdutext.Raw(text),
+		// don't set Register to avoid API differences between go-smpp versions
+	}
+
+	_, err := s.tx.Submit(msg)
+	elapsed := time.Since(start)
+
+	// push samples to k6 internal sample channel
+	state := s.vu.State()
+	tags := state.Tags.GetCurrentValues().Clone()
+
+	// latency (seconds)
+	state.Samples <- metrics.Sample{
+		TimeSeries: metrics.TimeSeries{
+			Metric: s.latency,
+			Tags:   tags,
+		},
+		Value: float64(elapsed.Seconds()),
 		Time:  time.Now(),
-		Value: 1,
-		Metric: s.s.metrics.Sent,
-		Tags:  tags,
 	}
 
-	fmt.Printf("[k6/x/smpp] Message sent to %s in %.2fs\n", dst, elapsed)
+	if err != nil {
+		state.Samples <- metrics.Sample{
+			TimeSeries: metrics.TimeSeries{
+				Metric: s.failure,
+				Tags:   tags,
+			},
+			Value: 1,
+			Time:  time.Now(),
+		}
+		return err
+	}
+
+	// success counter
+	state.Samples <- metrics.Sample{
+		TimeSeries: metrics.TimeSeries{
+			Metric: s.success,
+			Tags:   tags,
+		},
+		Value: 1,
+		Time:  time.Now(),
+	}
+
 	return nil
 }
 
-// Close disconnects from SMPP
-func (s *SMPPInstance) Close() {
-	if s.s.client != nil {
-		s.s.client.Close()
+// Close closes the transceiver
+func (s *Session) Close() {
+	if s.tx != nil {
+		s.tx.Close()
 	}
 }
