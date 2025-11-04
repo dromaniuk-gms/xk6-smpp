@@ -6,7 +6,6 @@ import (
 
 	"github.com/linxGnu/gosmpp"
 	"github.com/linxGnu/gosmpp/pdu"
-
 	"go.k6.io/k6/js/modules"
 	"go.k6.io/k6/metrics"
 )
@@ -59,45 +58,34 @@ func (i *SMPPInstance) Exports() modules.Exports {
 }
 
 type Session struct {
-	session *gosmpp.Session
+	client  *gosmpp.Transceiver
 	vu      modules.VU
 	latency *metrics.Metric
 	success *metrics.Metric
 	failure *metrics.Metric
 }
 
-// Connect creates and binds SMPP session
+// Connect establishes a new transceiver bind
 func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
-	settings := &gosmpp.SessionSettings{
-		EnquireLink: 10 * time.Second,
-		WriteTimeout: 5 * time.Second,
-		ReadTimeout:  10 * time.Second,
-		OnSubmitError: func(p pdu.PDU, err error) {
-			fmt.Printf("Submit error: %v\n", err)
-		},
-		OnPDU: func(p pdu.PDU, err error) {
-			if err != nil {
-				fmt.Printf("Received PDU error: %v\n", err)
-			}
-		},
-		BindOption: gosmpp.BindOption{
-			Addr:       addr,
-			SystemID:   cfg.SystemID,
-			Password:   cfg.Password,
-			SystemType: cfg.SystemType,
-			BindType:   gosmpp.Transceiver,
-		},
+	trx := gosmpp.NewTransceiver()
+	trx.Addr = addr
+	trx.User = cfg.SystemID
+	trx.Passwd = cfg.Password
+	trx.SystemType = cfg.SystemType
+	trx.Handler = func(p pdu.PDU, err error) {
+		if err != nil {
+			fmt.Printf("SMPP handler error: %v\n", err)
+		}
 	}
 
-	session, err := gosmpp.NewSession(settings)
-	if err != nil {
-		return nil, fmt.Errorf("failed to bind to %s: %v", addr, err)
+	if err := trx.Bind(); err != nil {
+		return nil, fmt.Errorf("bind failed: %v", err)
 	}
 
 	return &Session{
-		session: session,
+		client:  trx,
 		vu:      i.vu,
 		latency: i.latency,
 		success: i.success,
@@ -105,9 +93,8 @@ func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
 	}, nil
 }
 
-// SendSMS sends an SMPP submit_sm PDU
 func (s *Session) SendSMS(src, dst, message string) error {
-	if s.session == nil {
+	if s.client == nil {
 		return fmt.Errorf("not connected")
 	}
 
@@ -118,26 +105,23 @@ func (s *Session) SendSMS(src, dst, message string) error {
 	sm.DestinationAddr = dst
 	sm.ShortMessage = []byte(message)
 
-	if err := s.session.Transmitter().Submit(sm); err != nil {
+	if err := s.client.Transmitter().Submit(sm); err != nil {
 		s.pushMetric(s.failure, 1)
-		return err
+		return fmt.Errorf("submit error: %v", err)
 	}
 
-	elapsed := time.Since(start)
-	s.pushMetric(s.latency, elapsed.Seconds())
+	s.pushMetric(s.latency, time.Since(start).Seconds())
 	s.pushMetric(s.success, 1)
-
 	return nil
 }
 
 func (s *Session) pushMetric(metric *metrics.Metric, value float64) {
 	state := s.vu.State()
-	tags := state.Tags.GetCurrentValues().Clone()
-
+	tags := state.Tags.GetCurrentValues()
 	state.Samples <- metrics.Sample{
 		TimeSeries: metrics.TimeSeries{
 			Metric: metric,
-			Tags:   tags,
+			Tags:   &tags,
 		},
 		Value: value,
 		Time:  time.Now(),
@@ -145,7 +129,7 @@ func (s *Session) pushMetric(metric *metrics.Metric, value float64) {
 }
 
 func (s *Session) Close() {
-	if s.session != nil {
-		s.session.Close()
+	if s.client != nil {
+		s.client.Close()
 	}
 }
