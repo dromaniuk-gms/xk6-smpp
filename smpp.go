@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/fiorix/go-smpp/smpp"
-	"github.com/fiorix/go-smpp/smpp/pdutext"
 	"go.k6.io/k6/js/modules"
 	"go.k6.io/k6/metrics"
 )
@@ -125,7 +124,7 @@ func (s *Session) SendSMS(src, dst, text string) error {
 	msg := &smpp.ShortMessage{
 		Src:  src,
 		Dst:  dst,
-		Text: pdutext.Raw(text),
+		Text: []byte(text),
 		// don't set Register to avoid API differences between go-smpp versions
 	}
 
