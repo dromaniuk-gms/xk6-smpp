@@ -1,135 +1,252 @@
 package smpp
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/linxGnu/gosmpp"
+	"github.com/linxGnu/gosmpp/data"
 	"github.com/linxGnu/gosmpp/pdu"
 	"go.k6.io/k6/js/modules"
-	"go.k6.io/k6/metrics"
 )
 
 func init() {
-	modules.Register("k6/x/smpp", new(SMPP))
+	modules.Register("k6/x/smpp", new(RootModule))
 }
 
-type Config struct {
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	SystemID   string `json:"system_id"`
-	Password   string `json:"password"`
-	SystemType string `json:"system_type"`
+type RootModule struct{}
+
+type ModuleInstance struct {
+	vu modules.VU
 }
 
-type SMPP struct{}
-
-type SMPPInstance struct {
-	vu      modules.VU
-	latency *metrics.Metric
-	success *metrics.Metric
-	failure *metrics.Metric
+func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
+	return &ModuleInstance{vu: vu}
 }
 
-var _ modules.Module = &SMPP{}
-var _ modules.Instance = &SMPPInstance{}
+func (mi *ModuleInstance) Exports() modules.Exports {
+	return modules.Exports{Default: mi}
+}
 
-func (m *SMPP) NewModuleInstance(vu modules.VU) modules.Instance {
-	reg := vu.InitEnv().Registry
-	lat := reg.MustNewMetric("smpp_submit_latency", metrics.Trend)
-	suc := reg.MustNewMetric("smpp_submit_success", metrics.Counter)
-	fail := reg.MustNewMetric("smpp_submit_failure", metrics.Counter)
+type Client struct {
+	conn     *gosmpp.Session
+	systemID string
+}
 
-	return &SMPPInstance{
-		vu:      vu,
-		latency: lat,
-		success: suc,
-		failure: fail,
+type ConnectOptions struct {
+	Host            string
+	Port            int
+	SystemID        string
+	Password        string
+	SystemType      string
+	InterfaceVersion uint8
+	AddrTon         uint8
+	AddrNpi         uint8
+	AddressRange    string
+	WindowSize      uint8
+	ReadTimeout     int // seconds
+	WriteTimeout    int // seconds
+}
+
+// Connect establishes a connection to SMPP server
+func (mi *ModuleInstance) Connect(opts ConnectOptions) (*Client, error) {
+	if opts.Host == "" {
+		return nil, fmt.Errorf("host is required")
 	}
-}
+	if opts.Port == 0 {
+		opts.Port = 2775
+	}
+	if opts.SystemID == "" {
+		return nil, fmt.Errorf("systemID is required")
+	}
+	if opts.InterfaceVersion == 0 {
+		opts.InterfaceVersion = 0x34
+	}
+	if opts.WindowSize == 0 {
+		opts.WindowSize = 10
+	}
+	if opts.ReadTimeout == 0 {
+		opts.ReadTimeout = 10
+	}
+	if opts.WriteTimeout == 0 {
+		opts.WriteTimeout = 10
+	}
 
-func (i *SMPPInstance) Exports() modules.Exports {
-	return modules.Exports{
-		Default: i,
-		Named: map[string]interface{}{
-			"connect": i.Connect,
+	addr := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
+
+	auth := gosmpp.Auth{
+		SMSC:       addr,
+		SystemID:   opts.SystemID,
+		Password:   opts.Password,
+		SystemType: opts.SystemType,
+	}
+
+	session, err := gosmpp.NewSession(
+		gosmpp.TRXConnector(gosmpp.NonTLSDialer, auth),
+		gosmpp.Settings{
+			ReadTimeout:  time.Duration(opts.ReadTimeout) * time.Second,
+			WriteTimeout: time.Duration(opts.WriteTimeout) * time.Second,
+			OnPDU: func(p pdu.PDU, dir gosmpp.Direction) {
+				// Optional: handle PDU events
+			},
+			OnReceivingError: func(err error) {
+				// Handle receiving errors
+			},
+			OnRebindingError: func(err error) {
+				// Handle rebinding errors
+			},
+			OnClosed: func(state gosmpp.State) {
+				// Handle connection closed
+			},
 		},
-	}
-}
+		opts.WindowSize,
+	)
 
-type Session struct {
-	client  *gosmpp.Transceiver
-	vu      modules.VU
-	latency *metrics.Metric
-	success *metrics.Metric
-	failure *metrics.Metric
-}
-
-// Connect establishes a new transceiver bind
-func (i *SMPPInstance) Connect(cfg Config) (*Session, error) {
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-
-	trx := gosmpp.NewTransceiver()
-	trx.Addr = addr
-	trx.User = cfg.SystemID
-	trx.Passwd = cfg.Password
-	trx.SystemType = cfg.SystemType
-	trx.Handler = func(p pdu.PDU, err error) {
-		if err != nil {
-			fmt.Printf("SMPP handler error: %v\n", err)
-		}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 
-	if err := trx.Bind(); err != nil {
-		return nil, fmt.Errorf("bind failed: %v", err)
-	}
-
-	return &Session{
-		client:  trx,
-		vu:      i.vu,
-		latency: i.latency,
-		success: i.success,
-		failure: i.failure,
+	return &Client{
+		conn:     session,
+		systemID: opts.SystemID,
 	}, nil
 }
 
-func (s *Session) SendSMS(src, dst, message string) error {
-	if s.client == nil {
-		return fmt.Errorf("not connected")
+type SubmitSMOptions struct {
+	SourceAddr      string
+	DestAddr        string
+	ShortMessage    string
+	SourceAddrTon   uint8
+	SourceAddrNpi   uint8
+	DestAddrTon     uint8
+	DestAddrNpi     uint8
+	ESMClass        uint8
+	ProtocolID      uint8
+	PriorityFlag    uint8
+	RegisteredDelivery uint8
+	DataCoding      uint8
+	ValidityPeriod  string
+	ScheduleDeliveryTime string
+}
+
+// SubmitSM sends a short message
+func (c *Client) SubmitSM(opts SubmitSMOptions) (string, error) {
+	if c.conn == nil {
+		return "", fmt.Errorf("connection is nil")
 	}
 
-	start := time.Now()
-
-	sm := pdu.NewSubmitSM()
-	sm.SourceAddr = src
-	sm.DestinationAddr = dst
-	sm.ShortMessage = []byte(message)
-
-	if err := s.client.Transmitter().Submit(sm); err != nil {
-		s.pushMetric(s.failure, 1)
-		return fmt.Errorf("submit error: %v", err)
+	if opts.SourceAddr == "" {
+		return "", fmt.Errorf("source address is required")
+	}
+	if opts.DestAddr == "" {
+		return "", fmt.Errorf("destination address is required")
 	}
 
-	s.pushMetric(s.latency, time.Since(start).Seconds())
-	s.pushMetric(s.success, 1)
+	// Set defaults
+	if opts.SourceAddrTon == 0 {
+		opts.SourceAddrTon = 1 // International
+	}
+	if opts.SourceAddrNpi == 0 {
+		opts.SourceAddrNpi = 1 // E164
+	}
+	if opts.DestAddrTon == 0 {
+		opts.DestAddrTon = 1
+	}
+	if opts.DestAddrNpi == 0 {
+		opts.DestAddrNpi = 1
+	}
+
+	submitSM := pdu.NewSubmitSM().(*pdu.SubmitSM)
+	submitSM.SourceAddr = data.SMSCAddress{Addr: opts.SourceAddr, Ton: opts.SourceAddrTon, Npi: opts.SourceAddrNpi}
+	submitSM.DestAddr = data.SMSCAddress{Addr: opts.DestAddr, Ton: opts.DestAddrTon, Npi: opts.DestAddrNpi}
+	submitSM.ShortMessage = opts.ShortMessage
+	submitSM.ESMClass = opts.ESMClass
+	submitSM.ProtocolID = opts.ProtocolID
+	submitSM.PriorityFlag = opts.PriorityFlag
+	submitSM.RegisteredDelivery = opts.RegisteredDelivery
+	submitSM.DataCoding = opts.DataCoding
+	submitSM.ValidityPeriod = opts.ValidityPeriod
+	submitSM.ScheduleDeliveryTime = opts.ScheduleDeliveryTime
+
+	resp, err := c.conn.Transceiver().Submit(submitSM)
+	if err != nil {
+		return "", fmt.Errorf("failed to submit message: %w", err)
+	}
+
+	return resp.MessageID, nil
+}
+
+type QuerySMOptions struct {
+	MessageID  string
+	SourceAddr string
+	SourceAddrTon uint8
+	SourceAddrNpi uint8
+}
+
+// QuerySM queries the status of a previously submitted message
+func (c *Client) QuerySM(opts QuerySMOptions) (map[string]interface{}, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("connection is nil")
+	}
+
+	if opts.MessageID == "" {
+		return nil, fmt.Errorf("message ID is required")
+	}
+	if opts.SourceAddr == "" {
+		return nil, fmt.Errorf("source address is required")
+	}
+
+	if opts.SourceAddrTon == 0 {
+		opts.SourceAddrTon = 1
+	}
+	if opts.SourceAddrNpi == 0 {
+		opts.SourceAddrNpi = 1
+	}
+
+	querySM := pdu.NewQuerySM().(*pdu.QuerySM)
+	querySM.MessageID = opts.MessageID
+	querySM.SourceAddr = data.SMSCAddress{
+		Addr: opts.SourceAddr,
+		Ton:  opts.SourceAddrTon,
+		Npi:  opts.SourceAddrNpi,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.conn.Transceiver().QuerySM(ctx, querySM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query message: %w", err)
+	}
+
+	result := map[string]interface{}{
+		"messageID":   resp.MessageID,
+		"finalDate":   resp.FinalDate,
+		"messageState": resp.MessageState,
+		"errorCode":   resp.ErrorCode,
+	}
+
+	return result, nil
+}
+
+// Close closes the SMPP connection
+func (c *Client) Close() error {
+	if c.conn == nil {
+		return nil
+	}
+	c.conn.Close()
 	return nil
 }
 
-func (s *Session) pushMetric(metric *metrics.Metric, value float64) {
-	state := s.vu.State()
-	tags := state.Tags.GetCurrentValues()
-	state.Samples <- metrics.Sample{
-		TimeSeries: metrics.TimeSeries{
-			Metric: metric,
-			Tags:   &tags,
-		},
-		Value: value,
-		Time:  time.Now(),
+// Unbind sends an unbind request
+func (c *Client) Unbind() error {
+	if c.conn == nil {
+		return fmt.Errorf("connection is nil")
 	}
-}
 
-func (s *Session) Close() {
-	if s.client != nil {
-		s.client.Close()
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return c.conn.Transceiver().Unbind(ctx)
 }
